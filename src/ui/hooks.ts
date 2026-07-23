@@ -25,6 +25,8 @@ export function useNotesList(query: ListQuery) {
         // Omit optional keys entirely when unset (exactOptionalPropertyTypes).
         ...(query.assignedReviewerId !== null ? { assignedReviewerId: query.assignedReviewerId } : {}),
         ...(query.search ? { search: query.search } : {}),
+        ...(query.updatedAfter !== null ? { updatedAfter: query.updatedAfter } : {}),
+        ...(query.updatedBefore !== null ? { updatedBefore: query.updatedBefore } : {}),
         sortField: query.sortField,
         sortDir: query.sortDir,
         cursor: pageParam,

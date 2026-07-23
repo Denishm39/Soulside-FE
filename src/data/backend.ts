@@ -144,6 +144,33 @@ export class MockBackend {
     return { ok: true, eventId: result.event.eventId };
   }
 
+  /**
+   * Simulate other people viewing a note: emit presence on an interval with a
+   * rotating set of fake viewers. Returns a stop function. This is what makes
+   * the live presence indicator show activity in the local demo.
+   */
+  simulatePresence(noteId: string, intervalMs = 4000): () => void {
+    const pool: Array<{ id: string; role: 'REVIEWER' | 'CLINICIAN' | 'ADMIN' }> = [
+      { id: 'usr_patel', role: 'REVIEWER' },
+      { id: 'usr_okafor', role: 'ADMIN' },
+      { id: 'usr_ramirez', role: 'CLINICIAN' },
+    ];
+    const tick = (): void => {
+      const n = Math.floor(this.random() * (pool.length + 1)); // 0..pool.length viewers
+      const viewers = pool.slice(0, n);
+      this.realtime.emit({
+        type: 'note.presence',
+        eventId: `evt_presence_${noteId}_${Date.now()}`,
+        noteId,
+        viewers,
+        at: Date.now(),
+      });
+    };
+    const handle = setInterval(tick, intervalMs);
+    tick();
+    return () => clearInterval(handle);
+  }
+
   // -- fault injection ------------------------------------------------------
 
   private async simulateNetwork(): Promise<void> {

@@ -15,6 +15,7 @@ import { useRuntime } from '../RuntimeContext.js';
 import { useNote } from '../hooks.js';
 import { ActionBar } from './ActionBar.js';
 import { ConflictDialog } from './ConflictDialog.js';
+import { VersionHistory } from './VersionHistory.js';
 import { AutosaveEngine, type AutosaveState, type ConflictInfo, type SaveRequest } from '../../app/autosave.js';
 import { isContentEditable, type UserActionType } from '../../domain/machine.js';
 import { SOAP_SECTIONS, type NoteContent, type NoteSnapshot, type SoapSection } from '../../domain/types.js';
@@ -59,18 +60,51 @@ export function NoteDetailView(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [note?.id, note?.currentVersionId]);
 
-  // Presence subscription for this note; released on unmount / note change.
+  // Real-time subscription for this note: presence, plus live status/version
+  // pushes run through the reconciler and update the open note. Released on
+  // unmount / note change (ref-counted), and presence emission is stopped.
   useEffect(() => {
-    if (!id) return;
-    const release = runtime.subscriptions.acquire(id);
-    const off = runtime.backend.realtime.subscribe(id, (e) => {
-      if (e.type === 'note.presence') setViewers(e.viewers);
+    if (!id || !note) return;
+    const { reconciler, subscriptions, backend } = runtime;
+
+    reconciler.setLocalView(id, {
+      actor,
+      status: note.status,
+      assignedReviewerId: note.assignedReviewerId,
+      approvedAt: note.approvedAt,
+      headVersionId: note.currentVersionId,
+      editing: (engineRef.current?.getState().hasUnsavedChanges ?? false),
+      saveInFlight: engineRef.current?.getState().status === 'saving',
     });
+
+    const release = subscriptions.acquire(id);
+    const off = backend.realtime.subscribe(id, (event) => {
+      const effect = reconciler.ingest(event);
+      switch (effect.kind) {
+        case 'presence':
+          setViewers(effect.viewers);
+          break;
+        case 'status':
+        case 'version':
+          void refetch(); // adopt the server's new state for the open note
+          break;
+        case 'supersede':
+          void refetch(); // a version landed mid-edit; the merge is opened below
+          break;
+        default:
+          break;
+      }
+    });
+    const stopPresence = backend.simulatePresence(id);
+
     return () => {
+      stopPresence();
       off();
       release();
+      reconciler.removeLocalView(id);
     };
-  }, [id, runtime]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, note?.id, runtime]);
 
   // Open the merge dialog when autosave reports a conflict.
   useEffect(() => {
@@ -147,20 +181,24 @@ export function NoteDetailView(): JSX.Element {
         </p>
       )}
 
-      <div className="soap">
-        {SOAP_SECTIONS.map((s) => (
-          <label key={s} className="soap-section">
-            <span className="soap-label">{SECTION_LABELS[s]}</span>
-            <textarea
-              className="soap-input"
-              value={content.sections[s]}
-              readOnly={!editable}
-              aria-readonly={!editable}
-              onChange={(e) => onSectionChange(s, e.target.value)}
-              rows={4}
-            />
-          </label>
-        ))}
+      <div className="detail-body">
+        <div className="soap">
+          {SOAP_SECTIONS.map((s) => (
+            <label key={s} className="soap-section">
+              <span className="soap-label">{SECTION_LABELS[s]}</span>
+              <textarea
+                className="soap-input"
+                value={content.sections[s]}
+                readOnly={!editable}
+                aria-readonly={!editable}
+                onChange={(e) => onSectionChange(s, e.target.value)}
+                rows={4}
+              />
+            </label>
+          ))}
+        </div>
+
+        <VersionHistory versions={note.versions} currentVersionId={note.currentVersionId} />
       </div>
 
       {conflict && (

@@ -13,7 +13,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useNotesList } from '../hooks.js';
 import { useSelection } from '../selectionStore.js';
-import { parseQuery, toSearchParams, DEFAULT_QUERY, type SortField } from '../urlState.js';
+import { parseQuery, toSearchParams, toDateInput, REVIEWER_OPTIONS, type SortField } from '../urlState.js';
 import { NOTE_STATUSES, type NoteStatus } from '../../domain/types.js';
 import type { NoteRecord } from '../../data/store.js';
 
@@ -28,7 +28,12 @@ export function NotesListView(): JSX.Element {
 
   const rows: NoteRecord[] = useMemo(() => data?.pages.flatMap((p) => p.items) ?? [], [data]);
   const total = data?.pages[0]?.meta.total ?? 0;
-  const hasActiveFilter = query.statuses.length > 0 || query.search !== '' || query.assignedReviewerId !== null;
+  const hasActiveFilter =
+    query.statuses.length > 0 ||
+    query.search !== '' ||
+    query.assignedReviewerId !== null ||
+    query.updatedAfter !== null ||
+    query.updatedBefore !== null;
 
   const parentRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -124,6 +129,41 @@ function Filters({ query, onChange }: { query: ReturnType<typeof parseQuery>; on
         onChange={(e) => debounceSearch(e.target.value, (v) => onChange({ search: v }))}
         aria-label="Search notes"
       />
+      <label className="reviewer-filter">
+        <span className="sr-only">Filter by assigned reviewer</span>
+        <select
+          value={query.assignedReviewerId ?? ''}
+          onChange={(e) => onChange({ assignedReviewerId: e.target.value || null })}
+          aria-label="Assigned reviewer"
+        >
+          <option value="">Any reviewer</option>
+          {REVIEWER_OPTIONS.map((r) => (
+            <option key={r.id} value={r.id}>
+              {r.label}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className="date-filter">
+        <span className="sr-only">Updated after</span>
+        <input
+          type="date"
+          value={toDateInput(query.updatedAfter)}
+          onChange={(e) => onChange({ updatedAfter: e.target.value ? Date.parse(e.target.value) : null })}
+          aria-label="Updated after"
+        />
+      </label>
+      <label className="date-filter">
+        <span className="sr-only">Updated before</span>
+        <input
+          type="date"
+          value={toDateInput(query.updatedBefore)}
+          onChange={(e) => onChange({ updatedBefore: e.target.value ? Date.parse(e.target.value) : null })}
+          aria-label="Updated before"
+        />
+      </label>
+
       <fieldset className="status-filter">
         <legend className="sr-only">Filter by status</legend>
         {NOTE_STATUSES.map((s) => (

@@ -5,6 +5,10 @@ coverage/
 .DS_Store
 *.local
 
+# Vite writes these transient config timestamps on some filesystems
+vite.config.ts.timestamp-*.mjs
+vite.config.*.timestamp-*.mjs
+
 # IntelliJ / editor
 .idea/
 .junie/

@@ -57,9 +57,15 @@ export interface ListFilter {
   updatedBefore?: number;
 }
 
+export type SortField = 'updatedAt' | 'createdAt' | 'status';
+export type SortDir = 'asc' | 'desc';
+
 export interface ListParams extends ListFilter {
   cursor?: string | null;
   limit?: number;
+  /** Defaults to updatedAt desc — the canonical order used for the base index. */
+  sortField?: SortField;
+  sortDir?: SortDir;
 }
 
 export interface ListResult {
@@ -109,6 +115,18 @@ const SEED_STATUSES: NoteStatus[] = [
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
+
+/** Ordering for a status sort — roughly lifecycle progression. */
+const SORT_STATUS_RANK: Record<NoteStatus, number> = {
+  GENERATING: 0,
+  FAILED: 1,
+  READY_FOR_REVIEW: 2,
+  IN_REVIEW: 3,
+  REJECTED: 4,
+  AMENDED: 5,
+  APPROVED: 6,
+  LOCKED: 7,
+};
 
 export interface StoreOptions {
   seed?: number;
@@ -204,9 +222,24 @@ export class Store {
     return chain;
   }
 
-  private keyOf(id: string): Keyset {
+  private keyOf(id: string, field: SortField = 'updatedAt', dir: SortDir = 'desc'): Keyset {
     const note = this.notes.get(id);
-    return { sortValue: note ? note.updatedAt : 0, id };
+    const raw = note ? this.sortValueOf(note, field) : 0;
+    // compareKeyset orders by sortValue DESC; negating flips it to ascending,
+    // so one comparator serves both directions and both cursor slicing paths.
+    return { sortValue: dir === 'desc' ? raw : -raw, id };
+  }
+
+  private sortValueOf(note: NoteRecord, field: SortField): number {
+    switch (field) {
+      case 'createdAt':
+        return note.createdAt;
+      case 'status':
+        return SORT_STATUS_RANK[note.status];
+      case 'updatedAt':
+      default:
+        return note.updatedAt;
+    }
   }
 
   // -- reads ----------------------------------------------------------------
@@ -218,19 +251,26 @@ export class Store {
   list(params: ListParams = {}): ListResult {
     const limit = Math.min(Math.max(params.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT);
     const cursor = params.cursor ? decodeCursor(params.cursor) : null;
+    const field = params.sortField ?? 'updatedAt';
+    const dir = params.sortDir ?? 'desc';
+    const isDefaultSort = field === 'updatedAt' && dir === 'desc';
 
     const matched: string[] = [];
     for (const id of this.order) {
       const note = this.notes.get(id);
       if (note && this.matches(note, params)) matched.push(id);
     }
+    // `this.order` is already updatedAt-desc; re-sort only for a non-default sort.
+    if (!isDefaultSort) {
+      matched.sort((a, b) => compareKeyset(this.keyOf(a, field, dir), this.keyOf(b, field, dir)));
+    }
 
     let startIndex = 0;
     if (cursor) {
-      // Skip everything up to and including the cursor position. Because `order`
-      // is a total order and the cursor is a keyset, this is O(page) after the
-      // scan and never drops or duplicates a row even if data shifted.
-      startIndex = matched.findIndex((id) => isAfter(cursor, this.keyOf(id)));
+      // Skip everything up to and including the cursor position. Because the
+      // list is a total order and the cursor is a keyset, this never drops or
+      // duplicates a row even if data shifted between requests.
+      startIndex = matched.findIndex((id) => isAfter(cursor, this.keyOf(id, field, dir)));
       if (startIndex === -1) startIndex = matched.length;
     }
 
@@ -242,7 +282,7 @@ export class Store {
     return {
       items,
       cursor: {
-        next: hasMore && last ? encodeCursor(this.keyOf(last)) : null,
+        next: hasMore && last ? encodeCursor(this.keyOf(last, field, dir)) : null,
         hasMore,
       },
       meta: { total: matched.length, returned: items.length, generatedAt: this.now() },

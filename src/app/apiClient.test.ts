@@ -32,12 +32,18 @@ describe('BackendApi.transition', () => {
 });
 
 describe('BackendApi.saveVersion mapping', () => {
+  // Editing is only permitted for an IN_REVIEW note by its assigned reviewer.
+  const editableNote = async (api: ReturnType<typeof makeApi>['api']) => {
+    const note = (await api.listNotes({ statuses: ['IN_REVIEW'], limit: 1 })).items[0]!;
+    return { note, author: actor(note.assignedReviewerId!) };
+  };
+
   it('maps a successful save to a saved SaveOutcome', async () => {
     const { api } = makeApi();
-    const note = (await api.listNotes({ limit: 1 })).items[0]!;
+    const { note, author } = await editableNote(api);
     const outcome = await api.saveVersion(
       { noteId: note.id, baseVersionId: note.currentVersionId, content: content('x'), clientMutationId: 'm1', attempt: 1 },
-      actor('u'),
+      author,
     );
     expect(outcome.status).toBe('saved');
     if (outcome.status === 'saved') expect(outcome.version.id).toBeTruthy();
@@ -45,21 +51,32 @@ describe('BackendApi.saveVersion mapping', () => {
 
   it('maps a stale base to a conflict SaveOutcome with head + ancestor', async () => {
     const { api } = makeApi();
-    const note = (await api.listNotes({ limit: 1 })).items[0]!;
+    const { note, author } = await editableNote(api);
     const base = note.currentVersionId;
-    // Someone else advances the head first.
+    // The assigned reviewer advances the head first.
     await api.saveVersion(
       { noteId: note.id, baseVersionId: base, content: content('theirs'), clientMutationId: 'm_other', attempt: 1 },
-      actor('other'),
+      author,
     );
     const outcome = await api.saveVersion(
       { noteId: note.id, baseVersionId: base, content: content('mine'), clientMutationId: 'm_mine', attempt: 1 },
-      actor('me'),
+      author,
     );
     expect(outcome.status).toBe('conflict');
     if (outcome.status === 'conflict') {
       expect(outcome.current.id).toBeTruthy();
       expect(outcome.commonAncestor?.id).toBe(base);
     }
+  });
+
+  it('maps a forbidden save (e.g. a LOCKED note) to a non-retryable error', async () => {
+    const { api } = makeApi();
+    const locked = (await api.listNotes({ statuses: ['LOCKED'], limit: 1 })).items[0]!;
+    const outcome = await api.saveVersion(
+      { noteId: locked.id, baseVersionId: locked.currentVersionId, content: content('x'), clientMutationId: 'm_l', attempt: 1 },
+      actor('usr_attacker'),
+    );
+    expect(outcome.status).toBe('error');
+    if (outcome.status === 'error') expect(outcome.retryable).toBe(false);
   });
 });

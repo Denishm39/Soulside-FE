@@ -224,6 +224,25 @@ export class AutosaveEngine {
     this.beginSave();
   }
 
+  /**
+   * Dismiss a conflict without merging: keep the current draft but rebase it
+   * onto the given head so the engine leaves the conflict state and edits save
+   * again. Without this, cancelling the merge dialog would strand the engine in
+   * `conflict` forever and silently drop every later edit.
+   */
+  rebase(newBaseVersionId: string): void {
+    if (this.disposed) return;
+    this.conflict = null;
+    this.baseVersionId = newBaseVersionId;
+    this.dirty = this.draft !== null;
+    if (this.dirty) {
+      this.setStatus('dirty');
+      this.armDebounce();
+    } else {
+      this.setStatus('idle');
+    }
+  }
+
   dispose(): void {
     this.disposed = true;
     this.clearDebounce();

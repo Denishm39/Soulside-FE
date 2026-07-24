@@ -277,13 +277,13 @@ the whole dataset.
 
 ### 9. Testing — what I tested and why
 
-247 tests, split by cost and value:
+251 tests, split by cost and value:
 
 | Level | Where | What |
 |---|---|---|
 | Unit (pure) | `domain/*.test.ts` | state machine (58), diff (12), merge (12), authz (10) |
-| Integration (effectful) | `app/*.test.ts` | autosave (23), write queue (18), reconciler + reconnect (24), telemetry (18), save coordinator (7), api adapter (4) |
-| Backend | `data/backend.test.ts` | seeding, cursor pagination, 409, idempotency (34) |
+| Integration (effectful) | `app/*.test.ts` | autosave (26), write queue (18), reconciler + reconnect (24), telemetry (18), save coordinator (9), api adapter (5) |
+| Backend | `data/backend.test.ts` | seeding, cursor pagination, 409, idempotency, server-side authorization (36) |
 | Scenario | `scenarios.test.ts` | the five required scenarios plus the editor↔reconciler edit-loss path (7) |
 | Component + UI logic | `ui/**/*.test.{ts,tsx}` | action bar, conflict dialog, version history, URL round-trip, list-cache patching (20) |
 
@@ -327,13 +327,19 @@ production.
 
 ## Authorization & PII posture
 
-`domain/authz.ts` resolves every affordance through one pure `can(capability,
-ctx)`, a function of role × status × ownership. A denial distinguishes
+The state machine owns **action** authorization (the action bar derives every
+button from it, with denial reasons), and `domain/authz.ts` is a capability
+layer — a pure `can(capability, ctx)` over role × status × ownership — intended
+to back route- and component-level guards. A denial distinguishes
 `no-permission` from `not-owner` from `read-only`, because "you may not" and
-"there's nothing here" must never look the same to the user. **Client checks are
-UX only** — the mock server independently rejects illegal actions, and the UI
-handles that rejection, so a forged button click cannot bypass a guard. Note
-content never enters telemetry (see §7).
+"there's nothing here" must never look the same.
+
+**Client checks are UX only, and the server enforces independently.** The mock
+backend runs an authoritative check at the API boundary (`backend.saveVersion`
+calls `isContentEditable` before any write), so a hostile client posting a
+version to a LOCKED note — or a non-assigned reviewer — is refused server-side
+regardless of the UI. A test posts to a LOCKED note and asserts a `forbidden`
+response. Note content never enters telemetry (see §7).
 
 ---
 
@@ -355,11 +361,15 @@ Called out rather than hidden. (Offline routing, optimistic transitions, live
 list subscriptions, focusable disabled controls and per-section dirty tracking
 were previously listed here and are now implemented — see §3, §5, §6, §10.)
 
-- **Authorization is enforced at the action level** (the action bar resolves
-  through the state machine, and the server independently rejects illegal
-  actions). The `authz` module is designed to also back route-level and
-  component-level guards, but those wrappers aren't wired into the router yet.
-  The machine currently owns action authorization.
+- **Authorization**: the state machine owns action authorization (UI) and the
+  backend enforces edit permission server-side (§Authorization). The `authz.ts`
+  capability layer for **route- and component-level** guards is tested but not
+  yet wired into the router — that's the remaining authz gap.
+- **A few modules are tested but not yet wired into the running app**:
+  `ReconnectController` (needs a transport that can signal disconnect — the mock
+  channel never drops) and `RealtimeChannel.replaySince` (its replay cursor).
+  The reconciler, subscription manager, write queue and merge are all wired; the
+  reconnect loop is the piece the in-process mock doesn't exercise.
 - **List rows are the full `NoteRecord`** (every version + content), and the
   infinite query has no `maxPages`, so a very long scroll retains all fetched
   pages. A lightweight `NoteSummary` for the list plus a `maxPages` window are

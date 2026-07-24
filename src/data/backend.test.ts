@@ -228,8 +228,7 @@ describe('createVersion — idempotency and conflict', () => {
 
     const conflict = store.createVersion(note.id, base, content('mine'), reviewer('me'), 'mut_mine');
     expect(conflict.ok).toBe(false);
-    if (conflict.ok) return;
-    expect(conflict.error).toBe('version_conflict');
+    if (conflict.ok || conflict.error !== 'version_conflict') throw new Error('expected a version_conflict');
     expect(conflict.current.versionId).toBe(store.get(note.id)!.currentVersionId);
     // common ancestor is the base both edits share
     expect(conflict.commonAncestor?.versionId).toBe(base);
@@ -366,17 +365,33 @@ describe('MockBackend fault injection', () => {
     expect(page.items.length).toBeGreaterThan(0);
   });
 
-  it('emits a version_added event on a successful save', async () => {
-    const be = new MockBackend({ seed: 1, count: 10, faults: { enabled: false } });
-    const note = (await be.listNotes({ limit: 1 })).items[0]!;
+  it('emits a version_added event on a successful save by the assigned reviewer', async () => {
+    const be = new MockBackend({ seed: 1, count: 50, faults: { enabled: false } });
+    // Editing is only permitted for an IN_REVIEW note by its assigned reviewer.
+    const note = (await be.listNotes({ statuses: ['IN_REVIEW'], limit: 1 })).items[0]!;
+    const author = reviewer(note.assignedReviewerId!);
     const seen: string[] = [];
     be.realtime.subscribe(note.id, (e) => seen.push(e.type));
-    await be.saveVersion(
+    const result = await be.saveVersion(
       note.id,
       { baseVersionId: note.currentVersionId, content: content('x'), clientMutationId: 'm1' },
-      reviewer('u'),
+      author,
     );
+    expect(result.ok).toBe(true);
     expect(seen).toContain('note.version_added');
+  });
+
+  it('refuses a save to a note the caller may not edit (server authorization)', async () => {
+    const be = new MockBackend({ seed: 1, count: 100, faults: { enabled: false } });
+    const locked = (await be.listNotes({ statuses: ['LOCKED'], limit: 1 })).items[0]!;
+    // A hostile client posts a version to a LOCKED note — the server must refuse.
+    const result = await be.saveVersion(
+      locked.id,
+      { baseVersionId: locked.currentVersionId, content: content('evil'), clientMutationId: 'm_evil' },
+      reviewer('usr_attacker'),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBe('forbidden');
   });
 
   it('surfaces a 404 for an unknown note', async () => {

@@ -48,17 +48,29 @@ export class SaveCoordinator {
 
   /** The save function handed to the autosave engine. */
   readonly save: SaveFn = async (req: SaveRequest): Promise<SaveOutcome> => {
-    if (this.connectivity.isOnline()) {
-      try {
-        return await this.api.saveVersion(req, this.getActor());
-      } catch {
-        // The request failed at the transport level — treat as offline and
-        // fall through to the queue so the edit is not lost.
-        this.connectivity.reportUnreachable();
-      }
+    // Only a genuine offline state routes to the queue. 'unstable' (a flaky but
+    // present connection) still attempts the API and lets the autosave engine
+    // retry — otherwise a single injected 5% failure would strand every save in
+    // the queue forever.
+    if (this.connectivity.get() === 'offline') {
+      await this.enqueue(req);
+      return { status: 'queued' };
     }
-    await this.enqueue(req);
-    return { status: 'queued' };
+    try {
+      const outcome = await this.api.saveVersion(req, this.getActor());
+      this.connectivity.reportReachable(); // a success clears any 'unstable' state
+      return outcome;
+    } catch (err) {
+      this.connectivity.reportUnreachable();
+      // If we've now actually gone offline, queue the edit rather than lose it;
+      // otherwise surface a retryable error so the engine backs off and retries,
+      // and a later success will report us reachable again.
+      if (this.connectivity.get() === 'offline') {
+        await this.enqueue(req);
+        return { status: 'queued' };
+      }
+      throw err instanceof Error ? err : new Error('save failed');
+    }
   };
 
   /** Begin watching connectivity: replay the queue whenever we come back online. */

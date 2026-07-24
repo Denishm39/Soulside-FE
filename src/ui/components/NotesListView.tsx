@@ -147,6 +147,16 @@ function Row({ note }: { note: NoteRecord }): JSX.Element {
 }
 
 function Filters({ query, onChange }: { query: ReturnType<typeof parseQuery>; onChange: (n: Partial<ReturnType<typeof parseQuery>>) => void }): JSX.Element {
+  // Per-instance debounce timer, cleared on unmount (no module-global leak).
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+  }, []);
+  const debounceSearch = (value: string): void => {
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => onChange({ search: value }), 300);
+  };
+
   return (
     <div className="filters">
       <input
@@ -154,7 +164,7 @@ function Filters({ query, onChange }: { query: ReturnType<typeof parseQuery>; on
         className="search"
         placeholder="Search patient or note content"
         defaultValue={query.search}
-        onChange={(e) => debounceSearch(e.target.value, (v) => onChange({ search: v }))}
+        onChange={(e) => debounceSearch(e.target.value)}
         aria-label="Search notes"
       />
       <label className="reviewer-filter">
@@ -212,12 +222,6 @@ function Filters({ query, onChange }: { query: ReturnType<typeof parseQuery>; on
       </fieldset>
     </div>
   );
-}
-
-let searchTimer: ReturnType<typeof setTimeout> | null = null;
-function debounceSearch(value: string, apply: (v: string) => void): void {
-  if (searchTimer) clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => apply(value), 300);
 }
 
 function SortHeader({ field, dir, onSort }: { field: SortField; dir: 'asc' | 'desc'; onSort: (f: SortField, d: 'asc' | 'desc') => void }): JSX.Element {

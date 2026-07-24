@@ -334,6 +334,26 @@ describe('conflict', () => {
     expect(engine.getState().status).toBe('conflict');
   });
 
+  it('rebase dismisses the conflict and lets autosave resume (no trap)', async () => {
+    const { engine, scheduler, calls, deferreds } = setup();
+    engine.change(content('mine'));
+    scheduler.runAll();
+    deferreds[0]!.resolve({ status: 'conflict', current: { id: 'ver_9', revision: 7 }, commonAncestor: null });
+    await flush();
+    expect(engine.getState().status).toBe('conflict');
+
+    // "Keep editing": rebase onto the server head, keeping my draft.
+    engine.rebase('ver_9');
+    expect(engine.getState().status).toBe('dirty'); // no longer stuck in conflict
+    expect(engine.getState().conflict).toBeNull();
+
+    // A subsequent edit now saves again (the trap is gone).
+    engine.change(content('more'));
+    scheduler.runAll();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.baseVersionId).toBe('ver_9'); // rebased onto the new head
+  });
+
   it('resolveConflict continues from merged content against the new head', async () => {
     const { engine, scheduler, calls, deferreds } = setup();
     engine.change(content('mine'));

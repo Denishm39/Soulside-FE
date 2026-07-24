@@ -42,6 +42,9 @@ export function NoteDetailView(): JSX.Element {
   const [conflict, setConflict] = useState<{ info: ConflictInfo; base: NoteContent; theirs: NoteContent } | null>(null);
   const [viewers, setViewers] = useState<Viewer[]>([]);
   const [actionError, setActionError] = useState<string | null>(null);
+  // When set, the open conflict is a queue-replay conflict; resolving routes to
+  // the write queue (resolveHead) rather than the live autosave engine.
+  const [replayResolve, setReplayResolve] = useState<((merged: NoteContent) => void) | null>(null);
   const engineRef = useRef<AutosaveEngine | null>(null);
 
   // Open the three-way merge for a server version that superseded our base.
@@ -85,20 +88,20 @@ export function NoteDetailView(): JSX.Element {
     [refetch],
   );
 
-  // Build the editor + autosave engine ONCE per note id. Deliberately not keyed
-  // on currentVersionId: a server version advancing the head must not rebuild
-  // the engine and reset the editor — that was the edit-loss path. The engine's
-  // base advances via saves (settleSave) and clean fast-forwards instead.
+  // Build the editor + autosave engine once the note has LOADED, keyed on the
+  // note id. Keyed on note?.id (not the URL id) so it waits for real data —
+  // otherwise the editor initialises empty with an empty base version and the
+  // first edit false-conflicts. Not keyed on currentVersionId, so a server
+  // version advancing the head does NOT rebuild the engine or reset the editor
+  // (that was the edit-loss path); the base advances via saves and fast-forwards.
   useEffect(() => {
-    if (!id) return;
-    // Snapshot the initial head at mount from the query cache.
-    const initial = note && note.id === id ? note : undefined;
-    const head = initial?.versions.find((v) => v.versionId === initial.currentVersionId);
+    if (!note) return;
+    const head = note.versions.find((v) => v.versionId === note.currentVersionId);
     setContent(head ? structuredClone(head.content) : emptyContent());
 
     const engine = new AutosaveEngine({
-      noteId: id,
-      baseVersionId: initial?.currentVersionId ?? '',
+      noteId: note.id,
+      baseVersionId: note.currentVersionId,
       ...(head ? { initialContent: structuredClone(head.content) } : {}),
       // Route through the coordinator: online → API, offline → durable queue.
       save: (req: SaveRequest) => runtime.saveCoordinator.save(req),
@@ -110,7 +113,7 @@ export function NoteDetailView(): JSX.Element {
       unsub();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [note?.id]);
 
   // Keep the reconciler's view of this note continuously in sync with autosave
   // state, and tell it when a save lands so its own echo can't be misread as a
@@ -136,6 +139,10 @@ export function NoteDetailView(): JSX.Element {
       for (const e of deferred) {
         if (e.kind === 'supersede') void openMergeAgainst(e.serverVersionId);
       }
+      // Pull the freshly-saved version into the cache so the version history and
+      // head stay consistent (the engine is keyed on note?.id, so this refetch
+      // does not reset the editor).
+      void refetch();
     }
   }, [id, note, autosave, actor, runtime, openMergeAgainst]);
 
@@ -181,6 +188,24 @@ export function NoteDetailView(): JSX.Element {
       autosave.conflict.commonAncestor?.id,
     );
   }, [autosave?.status, autosave?.conflict, openMergeAgainst]);
+
+  // When offline-queue replay pauses on a conflict for THIS note, open the same
+  // merge dialog; resolving it hands the merged content back to the queue via
+  // resolveHead so replay can continue.
+  useEffect(() => {
+    runtime.onReplayConflict((state) => {
+      const blocked = state.blocked;
+      if (!blocked || blocked.entry.noteId !== id || !blocked.conflict) return;
+      void openMergeAgainst(
+        blocked.conflict.current.id,
+        blocked.conflict.commonAncestor?.id,
+      );
+      setReplayResolve(() => (merged: NoteContent) => {
+        void runtime.writeQueue.resolveHead(merged, blocked.conflict!.current.id);
+      });
+    });
+    // Registration is idempotent per mount; the handler closes over id.
+  }, [runtime, id, openMergeAgainst]);
 
   const snapshot: NoteSnapshot | null = useMemo(
     () =>
@@ -246,25 +271,32 @@ export function NoteDetailView(): JSX.Element {
     setActionError(null);
     runtime.telemetry.track('note.action', { noteId: id, action: type, status: snapshot.status });
 
-    const ack = await runtime.api.transition(id, action, actor);
-    if (ack.ok) {
-      // Reconcile: swap the provisional event id for the server's and clear the
-      // pending flag; mark it seen so the matching real-time echo dedupes.
-      runtime.reconciler.markSeen(ack.eventId);
-      queryClient.setQueryData<NoteRecord>(key, (old) =>
-        old
-          ? {
-              ...old,
-              events: old.events.map((e) =>
-                e.eventId === localEventId ? { ...e, eventId: ack.eventId, pending: false } : e,
-              ),
-            }
-          : old,
-      );
-    } else {
-      // Roll back cleanly to the pre-action snapshot and surface the reason.
+    try {
+      const ack = await runtime.api.transition(id, action, actor);
+      if (ack.ok) {
+        // Reconcile: swap the provisional event id for the server's and clear the
+        // pending flag; mark it seen so the matching real-time echo dedupes.
+        runtime.reconciler.markSeen(ack.eventId);
+        queryClient.setQueryData<NoteRecord>(key, (old) =>
+          old
+            ? {
+                ...old,
+                events: old.events.map((e) =>
+                  e.eventId === localEventId ? { ...e, eventId: ack.eventId, pending: false } : e,
+                ),
+              }
+            : old,
+        );
+      } else {
+        if (previous) queryClient.setQueryData(key, previous);
+        setActionError(ack.reason);
+      }
+    } catch (err) {
+      // The backend injects failures; a thrown transition must also roll back the
+      // optimistic state, not leave it applied (and never become an unhandled
+      // rejection).
       if (previous) queryClient.setQueryData(key, previous);
-      setActionError(ack.reason);
+      setActionError(err instanceof Error ? err.message : 'Action failed — please retry.');
     }
   };
 
@@ -327,11 +359,25 @@ export function NoteDetailView(): JSX.Element {
           mine={content}
           theirs={conflict.theirs}
           onResolve={(merged) => {
-            engineRef.current?.resolveConflict(merged, conflict.info.current.id);
-            setContent(merged);
+            if (replayResolve) {
+              replayResolve(merged); // hand back to the write queue's resolveHead
+              setReplayResolve(null);
+            } else {
+              engineRef.current?.resolveConflict(merged, conflict.info.current.id);
+              setContent(merged);
+            }
             setConflict(null);
           }}
-          onCancel={() => setConflict(null)}
+          onCancel={() => {
+            if (replayResolve) {
+              setReplayResolve(null); // leave the queue paused; user can retry later
+            } else {
+              // Dismiss without merging: keep my draft but rebase onto the server
+              // head so the engine leaves the conflict state and autosave resumes.
+              engineRef.current?.rebase(conflict.info.current.id);
+            }
+            setConflict(null);
+          }}
         />
       )}
     </article>

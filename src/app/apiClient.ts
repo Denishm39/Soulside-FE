@@ -9,7 +9,7 @@
  */
 
 import type { Action } from '../domain/machine.js';
-import type { Actor, NoteContent } from '../domain/types.js';
+import type { Actor } from '../domain/types.js';
 import type { ListParams, ListResult, NoteRecord } from '../data/store.js';
 import { MockBackend, ServerError } from '../data/backend.js';
 import type { SaveOutcome, SaveRequest } from './autosave.js';
@@ -77,6 +77,10 @@ export class BackendApi implements NotesApi {
   ): SaveOutcome {
     if (result.ok) {
       return { status: 'saved', version: { id: result.version.versionId, revision: result.version.revisionNumber } };
+    }
+    if (result.error === 'forbidden') {
+      // Server refused the save (status/role/ownership). Non-retryable.
+      return { status: 'error', retryable: false, message: result.reason };
     }
     return {
       status: 'conflict',

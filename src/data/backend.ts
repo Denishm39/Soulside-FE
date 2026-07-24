@@ -8,10 +8,21 @@
  * local dev can run clean.
  */
 
-import type { Action } from '../domain/machine.js';
-import type { Actor, NoteContent } from '../domain/types.js';
+import { isContentEditable, type Action } from '../domain/machine.js';
+import type { Actor, NoteContent, NoteSnapshot } from '../domain/types.js';
 import { RealtimeChannel } from './realtime.js';
 import { NotFoundError, Store, type ListParams, type ListResult, type NoteRecord, type SaveResult } from './store.js';
+
+/** The state-machine's minimal projection of a note record. */
+function toSnapshot(note: NoteRecord): NoteSnapshot {
+  return {
+    id: note.id,
+    status: note.status,
+    assignedReviewerId: note.assignedReviewerId,
+    currentVersionId: note.currentVersionId,
+    approvedAt: note.approvedAt,
+  };
+}
 
 export interface FaultConfig {
   /** Enable latency + failure injection. Off => deterministic and instant. */
@@ -81,7 +92,11 @@ export class MockBackend {
     await this.simulateNetwork();
     const note = this.store.get(id);
     if (!note) throw new ServerError(`note ${id} not found`, 404);
-    return note;
+    // Return an immutable snapshot: the store holds live records, so handing the
+    // reference out would let a later in-place store mutation silently change
+    // cached UI state (a stale head vs a newer revision). A clone is a per-fetch
+    // point-in-time copy, which is what an HTTP response would be.
+    return structuredClone(note);
   }
 
   /** POST /api/notes/:id/versions */
@@ -91,6 +106,21 @@ export class MockBackend {
     author: Actor,
   ): Promise<SaveResult> {
     await this.simulateNetwork();
+
+    // Authoritative server-side authorization at the API boundary. The client is
+    // untrusted, so a save whose status/role/ownership doesn't permit editing —
+    // e.g. a rogue POST to a LOCKED note or by a non-assigned reviewer — is
+    // refused here regardless of any client-side guard. Skipped for a duplicate
+    // (idempotent replay) so an already-accepted write still de-dupes cleanly.
+    const note = this.store.get(id);
+    if (note && !this.store.hasMutation(body.clientMutationId) && !isContentEditable(toSnapshot(note), author)) {
+      return {
+        ok: false,
+        error: 'forbidden',
+        reason: `Editing is not permitted for a ${note.status} note by ${author.role}.`,
+      };
+    }
+
     let result: SaveResult;
     try {
       result = this.store.createVersion(

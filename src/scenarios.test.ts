@@ -32,6 +32,7 @@ const admin = (id: string): Actor => ({ id, role: 'ADMIN', mfaVerifiedAt: Date.U
 const saveVia = (store: Store, actor: Actor): SaveFn => async (req): Promise<SaveOutcome> => {
   const r = store.createVersion(req.noteId, req.baseVersionId, req.content, actor, req.clientMutationId);
   if (r.ok) return { status: 'saved', version: { id: r.version.versionId, revision: r.version.revisionNumber } };
+  if (r.error === 'forbidden') return { status: 'error', retryable: false, message: r.reason };
   return {
     status: 'conflict',
     current: { id: r.current.versionId, revision: r.current.revisionNumber },
@@ -328,6 +329,7 @@ describe('Scenario 6: an edit during an in-flight save, with the save echo arriv
     const save: SaveFn = async (req): Promise<SaveOutcome> => {
       const r = store.createVersion(req.noteId, req.baseVersionId, req.content, A, req.clientMutationId);
       if (!r.ok) {
+        if (r.error === 'forbidden') return { status: 'error', retryable: false, message: r.reason };
         return {
           status: 'conflict',
           current: { id: r.current.versionId, revision: r.current.revisionNumber },
@@ -401,6 +403,7 @@ describe('Scenario 6: an edit during an in-flight save, with the save echo arriv
       // Our own save now conflicts (base was superseded).
       const r = store.createVersion(req.noteId, req.baseVersionId, req.content, A, req.clientMutationId);
       if (r.ok) return { status: 'saved', version: { id: r.version.versionId, revision: r.version.revisionNumber } };
+      if (r.error === 'forbidden') return { status: 'error', retryable: false, message: r.reason };
       return {
         status: 'conflict',
         current: { id: r.current.versionId, revision: r.current.revisionNumber },

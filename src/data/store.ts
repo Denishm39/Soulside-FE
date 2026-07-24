@@ -18,7 +18,6 @@ import type {
   NoteStatus,
   NoteVersion,
   ReviewEvent,
-  Role,
   SoapSection,
 } from '../domain/types.js';
 import { SOAP_SECTIONS } from '../domain/types.js';
@@ -81,7 +80,11 @@ export type SaveResult =
       error: 'version_conflict';
       current: NoteVersion;
       commonAncestor: NoteVersion | null;
-    };
+    }
+  // The server is authoritative: a save is refused when the note's status/role/
+  // ownership do not permit editing (e.g. a write to a LOCKED note), regardless
+  // of what the client believed.
+  | { ok: false; error: 'forbidden'; reason: string };
 
 // ---------------------------------------------------------------------------
 
@@ -246,6 +249,11 @@ export class Store {
 
   get(id: string): NoteRecord | null {
     return this.notes.get(id) ?? null;
+  }
+
+  /** Whether a mutation id has already been applied (for idempotent-replay checks). */
+  hasMutation(clientMutationId: string): boolean {
+    return this.mutations.has(clientMutationId);
   }
 
   list(params: ListParams = {}): ListResult {

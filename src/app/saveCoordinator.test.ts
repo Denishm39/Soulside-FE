@@ -113,15 +113,31 @@ describe('SaveCoordinator — offline', () => {
     expect(entries.depth).toBe(1);
   });
 
-  it('falls through to the queue when an online attempt throws', async () => {
+  it('re-throws a transport error while still reachable, for the engine to retry', async () => {
     const saveVersion = vi.fn(async () => {
-      throw new Error('network down');
+      throw new Error('network blip');
     });
     const { coordinator, queue, monitor } = setup({ online: true, saveVersion });
-    const outcome = await coordinator.save(req());
-    expect(outcome).toEqual({ status: 'queued' }); // not lost
-    expect(queue.depth).toBe(1);
-    expect(monitor.get()).toBe('unstable'); // transport reported unreachable
+    // A single failure must NOT strand the save in the queue — it stays a
+    // retryable error and connectivity is merely flagged unstable (recoverable).
+    await expect(coordinator.save(req())).rejects.toThrow();
+    expect(queue.depth).toBe(0);
+    expect(monitor.get()).toBe('unstable');
+  });
+
+  it('recovers to online after a later save succeeds', async () => {
+    let calls = 0;
+    const saveVersion = vi.fn(async (): Promise<SaveOutcome> => {
+      calls += 1;
+      if (calls === 1) throw new Error('blip');
+      return { status: 'saved', version: { id: 'v2', revision: 2 } };
+    });
+    const { coordinator, monitor } = setup({ online: true, saveVersion });
+    await expect(coordinator.save(req())).rejects.toThrow();
+    expect(monitor.get()).toBe('unstable');
+    const outcome = await coordinator.save(req({ clientMutationId: 'm2' }));
+    expect(outcome.status).toBe('saved');
+    expect(monitor.get()).toBe('online'); // reachable again, not stuck unstable
   });
 });
 

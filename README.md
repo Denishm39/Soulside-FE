@@ -172,11 +172,14 @@ stateDiagram-v2
 ### 3. Optimistic updates — apply then reconcile
 
 User actions update the client immediately and reconcile with the server
-response. A transition is validated against the machine *before* any API call,
-so an illegal action never leaves the client. On the wire, a rejection (invalid
-state, stale version, permission, MFA) rolls the UI back and surfaces the
-reason. For edits, the autosave engine emits an optimistic local state and only
-advances the base version when the server acks.
+response. A status transition is validated against the machine *before* any API
+call (illegal actions never leave the client), then applied optimistically: the
+status updates at once and a **pending local `ReviewEvent`** is appended. On ack,
+the provisional event id is swapped for the server's and the pending flag
+cleared (and marked seen, so the matching real-time echo dedupes). On rejection
+(invalid state, stale version, permission, MFA) the UI **rolls back** to the exact
+pre-action snapshot and surfaces the reason inline. Edits reconcile the same way
+through the autosave engine, which only advances the base version on ack.
 
 The general principle: the machine is the gate, the server is the judge, and the
 UI always shows *why* when the judge disagrees.
@@ -205,17 +208,24 @@ one contract.
 
 ### 5. Offline — a durable write queue
 
-`app/writeQueue.ts` keeps the app usable with no network. Writes are persisted
-to **IndexedDB** *before* they count as enqueued, so a crash right after an edit
-can't lose it, and the queue survives a full page reload (rehydrated on boot).
-Replay drains **FIFO, one at a time**, honouring `baseVersionId`; it stops at the
-first conflict or transient error and resumes exactly there on the next
-reconnect — no reordering, no skipping. A conflict during replay routes through
-the same three-way merge as a live save. Connectivity is a non-modal inline
-banner with three distinct states (online / offline-with-N-queued / syncing), so
-the user is never uncertain whether their last edit was saved. Storage is behind
-an interface, so the logic is tested against an in-memory fake and IndexedDB is a
-drop-in.
+Every editor save goes through a **`SaveCoordinator`** (`app/saveCoordinator.ts`):
+online it hits the API; offline — or when an online attempt fails at the
+transport level — it persists to the durable queue and the autosave engine
+reports a first-class **`queued`** state. So offline is a real application
+feature, not just a library the tests exercise.
+
+`app/writeQueue.ts` persists to **IndexedDB** *before* a write counts as
+enqueued, so a crash right after an edit can't lose it, and the queue survives a
+full page reload (rehydrated on boot). Successive offline edits to a note
+**coalesce into one queued write** (`upsertForNote`), so they replay cleanly
+against a single base instead of conflicting with each other. Replay drains
+**FIFO, one at a time**, honouring `baseVersionId`; it stops at the first
+conflict or transient error and resumes exactly there on the next reconnect — no
+reordering, no skipping. Connectivity returning triggers replay automatically,
+and a replay conflict routes through the same three-way merge as a live save.
+Connectivity is a non-modal inline banner with distinct states (online /
+offline-with-N-queued / syncing). Storage is behind an interface, tested against
+an in-memory fake with IndexedDB as a drop-in.
 
 ### 6. Real-time — reconciling pushes with local state
 
@@ -232,9 +242,13 @@ drop-in.
   effect that opens the three-way merge; a status change that invalidates the
   current edit is flagged for a graceful interrupt, never dropped.
 
-Subscriptions are **ref-counted** and reconcile to the viewport, and reconnect
-uses **exponential backoff with jitter** plus a **replay cursor** — on reconnect
-we request everything since the last event, because we don't assume the socket
+Subscriptions are **ref-counted** and reconcile to the viewport: the virtualized
+list calls `setActive(visibleIds)` as rows scroll in and out, so only on-screen
+notes are subscribed and nothing leaks across a long session. A status push for a
+visible row **patches that row in the query cache** (`applyStatusToPages`)
+instead of refetching, so the list never jumps or blinks. Reconnect uses
+**exponential backoff with jitter** plus a **replay cursor** — on reconnect we
+request everything since the last event, because we don't assume the socket
 dropped nothing.
 
 ### 7. Telemetry — batched, resilient, PII-safe
@@ -263,15 +277,15 @@ the whole dataset.
 
 ### 9. Testing — what I tested and why
 
-223 tests, split by cost and value:
+247 tests, split by cost and value:
 
 | Level | Where | What |
 |---|---|---|
 | Unit (pure) | `domain/*.test.ts` | state machine (58), diff (12), merge (12), authz (10) |
-| Integration (effectful) | `app/*.test.ts` | autosave (19), write queue (15), reconciler + reconnect (24), telemetry (18) |
+| Integration (effectful) | `app/*.test.ts` | autosave (23), write queue (18), reconciler + reconnect (24), telemetry (18), save coordinator (7), api adapter (4) |
 | Backend | `data/backend.test.ts` | seeding, cursor pagination, 409, idempotency (34) |
 | Scenario | `scenarios.test.ts` | the five required scenarios plus the editor↔reconciler edit-loss path (7) |
-| Component + URL state | `ui/**/*.test.{ts,tsx}` | action bar, conflict dialog, version history, URL round-trip (14) |
+| Component + UI logic | `ui/**/*.test.{ts,tsx}` | action bar, conflict dialog, version history, URL round-trip, list-cache patching (20) |
 
 The emphasis is deliberate: the state machine and the pure logic get exhaustive
 unit tests (every illegal transition is enumerated and asserted refused); the
@@ -292,19 +306,22 @@ superseded the base, and a 500-note session with no leaks.
 Target: **WCAG 2.2 AA**. What's implemented:
 
 - **Keyboard**: the app is operable end to end — a skip link to main content,
-  visible focus rings (`:focus-visible`), native controls (buttons, checkboxes,
-  radios, textareas) throughout, and the conflict dialog is a focus-managed
-  `role="dialog"` with `aria-modal`.
-- **Screen-reader semantics**: save status, connectivity, and the list count are
-  `aria-live="polite"` regions, so changes are announced; sortable columns carry
-  `aria-sort`; the diff uses semantic `<ins>`/`<del>` so changes aren't conveyed
-  by colour alone; disabled actions carry the reason in their `aria-label`.
-- **Status not by colour alone**: every status pill has a text label.
+  visible focus rings (`:focus-visible`), native controls throughout, and the
+  conflict dialog is a focus-managed `role="dialog"` with `aria-modal`.
+  Disabled actions use `aria-disabled` (not the `disabled` attribute) with a
+  guarded click, so they stay **keyboard-focusable and their reason is reachable**
+  — the users who most need the explanation can get to it.
+- **Screen-reader semantics**: save status, connectivity, the list count and
+  action errors are `aria-live` / `role="alert"` regions; sort controls sit in
+  `role="columnheader"` cells carrying `aria-sort`; the diff uses semantic
+  `<ins>`/`<del>` so changes aren't conveyed by colour alone.
+- **Status not by colour alone**: every status pill has a text label; per-section
+  unsaved-change dots carry an `aria-label`.
 
-Documented gaps (honest): the conflict dialog traps initial focus but does not
-yet implement a full focus *cycle* trap; there is no automated `axe` run in CI;
-and colour-contrast has been eyeballed against AA, not formally audited. These
-are the first things I'd close for a production release.
+Documented gaps (honest): the conflict dialog traps initial focus but not a full
+focus *cycle*; there is no automated `axe` run in CI; and colour-contrast has
+been eyeballed against AA, not formally audited. First things I'd close for
+production.
 
 ---
 
@@ -334,20 +351,27 @@ content never enters telemetry (see §7).
 
 ## Known limitations (scoping)
 
-Called out rather than hidden:
+Called out rather than hidden. (Offline routing, optimistic transitions, live
+list subscriptions, focusable disabled controls and per-section dirty tracking
+were previously listed here and are now implemented — see §3, §5, §6, §10.)
 
-- **Offline routing of autosave.** The write queue is fully built, tested, and
-  hydrated/replayed on boot, but the editor's autosave currently saves online
-  directly rather than funnelling *every* edit through the queue when offline.
-  Both paths exist and are tested; unifying them (all writes through the queue,
-  with "queued" as a first-class autosave state) is the clean next step.
 - **Authorization is enforced at the action level** (the action bar resolves
-  through `can()`, and the server independently rejects illegal actions). The
-  `authz` module is designed to also back route-level and component-level
-  guards, but those wrappers aren't wired into the router yet.
+  through the state machine, and the server independently rejects illegal
+  actions). The `authz` module is designed to also back route-level and
+  component-level guards, but those wrappers aren't wired into the router yet.
+  The machine currently owns action authorization.
+- **List rows are the full `NoteRecord`** (every version + content), and the
+  infinite query has no `maxPages`, so a very long scroll retains all fetched
+  pages. A lightweight `NoteSummary` for the list plus a `maxPages` window are
+  the right next steps for true 100k-scale memory behaviour.
+- **Telemetry resilience is wired in `main.tsx`** (flush on route/visibility,
+  beacon-and-park on unload) but the runtime supplies a stub sink, so there is
+  no real transport or persistent park store behind it in the demo. `patientId`
+  is allowlisted; in production I'd hash/pseudonymise it.
 - **Bulk actions** (assign reviewer / request regeneration) are stubbed
   placeholders — the selection plumbing that survives pagination is real, the
-  actions themselves are demo handlers.
+  actions themselves are demo handlers. The rejection-reason prompt still uses
+  `window.prompt`; the action rejection/error path is an accessible inline alert.
 - **The provided `simulate_workflow.ts` script isn't directly runnable.** It
   drives the backend over HTTP; this mock backend is in-process (no HTTP
   server), which keeps the app dependency-light and the tests fast. To run the

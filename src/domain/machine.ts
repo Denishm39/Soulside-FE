@@ -406,7 +406,7 @@ export function availableActions(
 }
 
 function probeAction(type: UserActionType): Action {
-  return type === 'reject' ? { type, reason: ' probe' } : { type };
+  return type === 'reject' ? { type, reason: 'probe' } : { type };
 }
 
 /**

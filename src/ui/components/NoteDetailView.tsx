@@ -9,7 +9,7 @@
  * LOCKED notes render read-only with an Amend affordance.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useRuntime } from '../RuntimeContext.js';
 import { useNote } from '../hooks.js';
@@ -40,15 +40,61 @@ export function NoteDetailView(): JSX.Element {
   const [viewers, setViewers] = useState<Viewer[]>([]);
   const engineRef = useRef<AutosaveEngine | null>(null);
 
-  // (Re)build the editor + autosave engine when the note changes.
+  // Open the three-way merge for a server version that superseded our base.
+  // mine = current draft, theirs = the server version, base = our edit's base
+  // (the last version we share). This is the SAME dialog as an autosave 409.
+  const openMergeAgainst = useCallback(
+    async (serverVersionId: string, ancestorVersionId?: string) => {
+      const fresh = await refetch();
+      const rec = fresh.data;
+      const engine = engineRef.current;
+      if (!rec || !engine) return;
+      const baseId = ancestorVersionId ?? engine.getState().baseVersionId;
+      const theirsVer = rec.versions.find((v) => v.versionId === serverVersionId);
+      const baseVer = rec.versions.find((v) => v.versionId === baseId);
+      setConflict({
+        info: {
+          current: { id: serverVersionId, revision: theirsVer?.revisionNumber ?? 0 },
+          commonAncestor: { id: baseId, revision: baseVer?.revisionNumber ?? 0 },
+        },
+        theirs: theirsVer?.content ?? emptyContent(),
+        base: baseVer?.content ?? emptyContent(),
+      });
+    },
+    [refetch],
+  );
+
+  // A clean server version arrived while we were NOT editing: fast-forward the
+  // editor to it without clobbering anything (there is nothing unsaved to lose).
+  const fastForward = useCallback(
+    async (versionId: string) => {
+      const fresh = await refetch();
+      const rec = fresh.data;
+      const engine = engineRef.current;
+      if (!rec || !engine) return;
+      engine.adoptServerVersion(versionId);
+      if (!engine.getState().hasUnsavedChanges) {
+        const head = rec.versions.find((v) => v.versionId === versionId);
+        if (head) setContent(structuredClone(head.content));
+      }
+    },
+    [refetch],
+  );
+
+  // Build the editor + autosave engine ONCE per note id. Deliberately not keyed
+  // on currentVersionId: a server version advancing the head must not rebuild
+  // the engine and reset the editor — that was the edit-loss path. The engine's
+  // base advances via saves (settleSave) and clean fast-forwards instead.
   useEffect(() => {
-    if (!note) return;
-    const head = note.versions.find((v) => v.versionId === note.currentVersionId);
-    setContent(head ? structuredClone(head.content) : { sections: { S: '', O: '', A: '', P: '' } });
+    if (!id) return;
+    // Snapshot the initial head at mount from the query cache.
+    const initial = note && note.id === id ? note : undefined;
+    const head = initial?.versions.find((v) => v.versionId === initial.currentVersionId);
+    setContent(head ? structuredClone(head.content) : emptyContent());
 
     const engine = new AutosaveEngine({
-      noteId: note.id,
-      baseVersionId: note.currentVersionId,
+      noteId: id,
+      baseVersionId: initial?.currentVersionId ?? '',
       save: (req: SaveRequest) => runtime.api.saveVersion(req, actor),
     });
     engineRef.current = engine;
@@ -58,25 +104,40 @@ export function NoteDetailView(): JSX.Element {
       unsub();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [note?.id, note?.currentVersionId]);
+  }, [id]);
 
-  // Real-time subscription for this note: presence, plus live status/version
-  // pushes run through the reconciler and update the open note. Released on
-  // unmount / note change (ref-counted), and presence emission is stopped.
+  // Keep the reconciler's view of this note continuously in sync with autosave
+  // state, and tell it when a save lands so its own echo can't be misread as a
+  // concurrent supersede. Any events deferred during the in-flight save are
+  // flushed here and handled.
+  const lastSettledRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!id || !note) return;
-    const { reconciler, subscriptions, backend } = runtime;
-
+    if (!id || !note || !autosave) return;
+    const { reconciler } = runtime;
     reconciler.setLocalView(id, {
       actor,
       status: note.status,
       assignedReviewerId: note.assignedReviewerId,
       approvedAt: note.approvedAt,
-      headVersionId: note.currentVersionId,
-      editing: (engineRef.current?.getState().hasUnsavedChanges ?? false),
-      saveInFlight: engineRef.current?.getState().status === 'saving',
+      headVersionId: autosave.baseVersionId || note.currentVersionId,
+      editing: autosave.hasUnsavedChanges,
+      saveInFlight: autosave.status === 'saving' || autosave.status === 'retrying',
     });
 
+    if (autosave.lastSavedVersionId && autosave.lastSavedVersionId !== lastSettledRef.current) {
+      lastSettledRef.current = autosave.lastSavedVersionId;
+      const deferred = reconciler.settleSave(id, autosave.lastSavedVersionId);
+      for (const e of deferred) {
+        if (e.kind === 'supersede') void openMergeAgainst(e.serverVersionId);
+      }
+    }
+  }, [id, note, autosave, actor, runtime, openMergeAgainst]);
+
+  // Real-time subscription for this note: presence + live pushes through the
+  // reconciler. Ref-counted; released with presence emission on unmount.
+  useEffect(() => {
+    if (!id) return;
+    const { reconciler, subscriptions, backend } = runtime;
     const release = subscriptions.acquire(id);
     const off = backend.realtime.subscribe(id, (event) => {
       const effect = reconciler.ingest(event);
@@ -85,44 +146,35 @@ export function NoteDetailView(): JSX.Element {
           setViewers(effect.viewers);
           break;
         case 'status':
+          void refetch(); // content is preserved: the engine is keyed on id only
+          break;
         case 'version':
-          void refetch(); // adopt the server's new state for the open note
+          if (effect.mode === 'fast-forward') void fastForward(effect.versionId);
           break;
         case 'supersede':
-          void refetch(); // a version landed mid-edit; the merge is opened below
+          void openMergeAgainst(effect.serverVersionId); // same merge, draft intact
           break;
         default:
           break;
       }
     });
     const stopPresence = backend.simulatePresence(id);
-
     return () => {
       stopPresence();
       off();
       release();
       reconciler.removeLocalView(id);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, note?.id, runtime]);
+  }, [id, runtime, refetch, fastForward, openMergeAgainst]);
 
-  // Open the merge dialog when autosave reports a conflict.
+  // Open the merge dialog when autosave itself reports a 409 conflict.
   useEffect(() => {
-    if (autosave?.status !== 'conflict' || !autosave.conflict || !note) return;
-    void (async () => {
-      const fresh = await refetch();
-      const rec = fresh.data ?? note;
-      const theirs = rec.versions.find((v) => v.versionId === autosave.conflict!.current.id)?.content;
-      const base = autosave.conflict!.commonAncestor
-        ? rec.versions.find((v) => v.versionId === autosave.conflict!.commonAncestor!.id)?.content
-        : undefined;
-      setConflict({
-        info: autosave.conflict!,
-        theirs: theirs ?? emptyContent(),
-        base: base ?? emptyContent(),
-      });
-    })();
-  }, [autosave?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (autosave?.status !== 'conflict' || !autosave.conflict) return;
+    void openMergeAgainst(
+      autosave.conflict.current.id,
+      autosave.conflict.commonAncestor?.id,
+    );
+  }, [autosave?.status, autosave?.conflict, openMergeAgainst]);
 
   const snapshot: NoteSnapshot | null = useMemo(
     () =>

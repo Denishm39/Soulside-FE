@@ -265,3 +265,163 @@ describe('Scenario 5: reviewing 500 notes back-to-back leaks nothing', () => {
     expect(reconciler.seenCount).toBeLessThanOrEqual(2000); // dedupe set stayed bounded
   });
 });
+
+describe('Scenario 6: an edit during an in-flight save, with the save echo arriving before its ack', () => {
+  // Encodes the exact coordination NoteDetailView performs between the autosave
+  // engine and the reconciler, which is where the naive wiring could lose an
+  // edit: the engine keeps the draft (not rebuilt on server versions), the
+  // reconciler is kept in sync with save state, and settleSave() reconciles our
+  // own version echo so it is not mistaken for a concurrent supersede.
+
+  const wireEngineToReconciler = (
+    engine: AutosaveEngine,
+    reconciler: Reconciler,
+    noteId: string,
+    actor: Actor,
+    onSupersede: (versionId: string) => void,
+  ) => {
+    let settled: string | null = null;
+    return engine.subscribe((s) => {
+      reconciler.setLocalView(noteId, {
+        actor,
+        status: 'IN_REVIEW',
+        assignedReviewerId: actor.id,
+        approvedAt: null,
+        headVersionId: s.baseVersionId,
+        editing: s.hasUnsavedChanges,
+        saveInFlight: s.status === 'saving' || s.status === 'retrying',
+      });
+      if (s.lastSavedVersionId && s.lastSavedVersionId !== settled) {
+        settled = s.lastSavedVersionId;
+        for (const e of reconciler.settleSave(noteId, s.lastSavedVersionId)) {
+          if (e.kind === 'supersede') onSupersede(e.serverVersionId);
+        }
+      }
+    });
+  };
+
+  it('keeps the follow-up edit and does not treat our own echo as a supersede', async () => {
+    const store = new Store({ seed: 1, count: 20, now: clock() });
+    const ready = store.list({ statuses: ['READY_FOR_REVIEW'], limit: 1 }).items[0]!;
+    const A = reviewer('usr_a');
+    store.transition(ready.id, { type: 'start_review' }, A);
+    const base = store.get(ready.id)!.currentVersionId;
+    const baseContent = contentOf(store, ready.id, base);
+
+    const reconciler = new Reconciler();
+    reconciler.setLocalView(ready.id, {
+      actor: A,
+      status: 'IN_REVIEW',
+      assignedReviewerId: A.id,
+      approvedAt: null,
+      headVersionId: base,
+      editing: false,
+      saveInFlight: false,
+    });
+
+    const echoEffects: string[] = [];
+    const supersedes: string[] = [];
+
+    // The save writes to the store, then emits the WS echo of that write BEFORE
+    // returning (i.e. before the client sees the ack) — the ordering the brief
+    // calls out. Because saveInFlight is already true, the echo is deferred.
+    const save: SaveFn = async (req): Promise<SaveOutcome> => {
+      const r = store.createVersion(req.noteId, req.baseVersionId, req.content, A, req.clientMutationId);
+      if (!r.ok) {
+        return {
+          status: 'conflict',
+          current: { id: r.current.versionId, revision: r.current.revisionNumber },
+          commonAncestor: r.commonAncestor
+            ? { id: r.commonAncestor.versionId, revision: r.commonAncestor.revisionNumber }
+            : null,
+        };
+      }
+      const versionId = r.version.versionId;
+      const echo = reconciler.ingest({
+        type: 'note.version_added',
+        seq: 1,
+        eventId: `evt_${versionId}`,
+        noteId: req.noteId,
+        version: { id: versionId, revision: r.version.revisionNumber },
+        at: 1,
+      });
+      echoEffects.push(echo.kind);
+      return { status: 'saved', version: { id: versionId, revision: r.version.revisionNumber } };
+    };
+
+    const engine = new AutosaveEngine({ noteId: ready.id, baseVersionId: base, save });
+    const unsub = wireEngineToReconciler(engine, reconciler, ready.id, A, (v) => supersedes.push(v));
+
+    // Edit, flush to start the save, then edit again while it is in flight.
+    engine.change({ sections: { ...baseContent.sections, S: 'first edit' } });
+    engine.flush();
+    engine.change({ sections: { ...baseContent.sections, S: 'first edit', A: 'second edit mid-save' } });
+    await tick();
+    await tick();
+
+    // The echo of our own save was deferred (not a supersede), and the
+    // follow-up edit was saved rather than lost.
+    expect(echoEffects[0]).toBe('deferred');
+    expect(supersedes).toEqual([]); // our own echo never became a merge
+    const finalContent = contentOf(store, ready.id, store.get(ready.id)!.currentVersionId);
+    expect(finalContent.sections.A).toContain('second edit mid-save'); // not lost
+    unsub();
+  });
+
+  it('still raises a supersede when the version echoed mid-save belongs to someone else', async () => {
+    const store = new Store({ seed: 3, count: 20, now: clock() });
+    const ready = store.list({ statuses: ['READY_FOR_REVIEW'], limit: 1 }).items[0]!;
+    const A = reviewer('usr_a');
+    store.transition(ready.id, { type: 'start_review' }, A);
+    const base = store.get(ready.id)!.currentVersionId;
+    const baseContent = contentOf(store, ready.id, base);
+
+    const reconciler = new Reconciler();
+    const supersedes: string[] = [];
+
+    const save: SaveFn = async (req): Promise<SaveOutcome> => {
+      // A colleague's version lands (different id) while our save is in flight.
+      const colleague = store.createVersion(
+        req.noteId,
+        req.baseVersionId,
+        { sections: { ...baseContent.sections, O: 'colleague edit' } },
+        reviewer('usr_b'),
+        'mut_colleague',
+      );
+      if (colleague.ok) {
+        reconciler.ingest({
+          type: 'note.version_added',
+          seq: 1,
+          eventId: 'evt_colleague',
+          noteId: req.noteId,
+          version: { id: colleague.version.versionId, revision: colleague.version.revisionNumber },
+          at: 1,
+        });
+      }
+      // Our own save now conflicts (base was superseded).
+      const r = store.createVersion(req.noteId, req.baseVersionId, req.content, A, req.clientMutationId);
+      if (r.ok) return { status: 'saved', version: { id: r.version.versionId, revision: r.version.revisionNumber } };
+      return {
+        status: 'conflict',
+        current: { id: r.current.versionId, revision: r.current.revisionNumber },
+        commonAncestor: r.commonAncestor
+          ? { id: r.commonAncestor.versionId, revision: r.commonAncestor.revisionNumber }
+          : null,
+      };
+    };
+
+    const engine = new AutosaveEngine({ noteId: ready.id, baseVersionId: base, save });
+    const unsub = wireEngineToReconciler(engine, reconciler, ready.id, A, (v) => supersedes.push(v));
+
+    engine.change({ sections: { ...baseContent.sections, A: 'my edit' } });
+    engine.flush();
+    await tick();
+    await tick();
+
+    // Either the autosave 409 or the deferred colleague echo surfaces a
+    // conflict; in both the draft is preserved for the merge, never dropped.
+    const conflicted = engine.getState().status === 'conflict' || supersedes.length > 0;
+    expect(conflicted).toBe(true);
+    unsub();
+  });
+});

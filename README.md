@@ -263,14 +263,14 @@ the whole dataset.
 
 ### 9. Testing — what I tested and why
 
-221 tests, split by cost and value:
+223 tests, split by cost and value:
 
 | Level | Where | What |
 |---|---|---|
 | Unit (pure) | `domain/*.test.ts` | state machine (58), diff (12), merge (12), authz (10) |
 | Integration (effectful) | `app/*.test.ts` | autosave (19), write queue (15), reconciler + reconnect (24), telemetry (18) |
 | Backend | `data/backend.test.ts` | seeding, cursor pagination, 409, idempotency (34) |
-| Scenario | `scenarios.test.ts` | the five required scenarios, end to end (5) |
+| Scenario | `scenarios.test.ts` | the five required scenarios plus the editor↔reconciler edit-loss path (7) |
 | Component + URL state | `ui/**/*.test.{ts,tsx}` | action bar, conflict dialog, version history, URL round-trip (14) |
 
 The emphasis is deliberate: the state machine and the pure logic get exhaustive

@@ -25,11 +25,25 @@ Requires Node 20+.
 
 ```bash
 npm install
-npm run dev        # start the app (Vite) at http://localhost:5173
-npm run build      # typecheck + production build
-npm test           # run the full test suite (Vitest)
-npm run typecheck  # tsc --noEmit, strict
 ```
+
+```bash
+npm run dev
+```
+
+Start the app (Vite) at http://localhost:5173.
+
+```bash
+npm run build
+```
+
+Typecheck (`tsc --noEmit`) plus a production build.
+
+```bash
+npm test
+```
+
+Run the full test suite (Vitest). `npm run typecheck` runs the strict typecheck on its own.
 
 There is no separate backend to start: the app runs against an in-process **mock
 backend** that simulates the REST endpoints (100–800 ms latency, ~5 % injected

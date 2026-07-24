@@ -9,6 +9,9 @@ coverage/
 vite.config.ts.timestamp-*.mjs
 vite.config.*.timestamp-*.mjs
 
+# FUSE/mount artifacts left when a file is rewritten while open
+.fuse_hidden*
+
 # IntelliJ / editor
 .idea/
 .junie/

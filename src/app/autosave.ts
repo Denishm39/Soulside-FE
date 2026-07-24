@@ -17,7 +17,7 @@
  * the whole thing is driven deterministically in tests with no real time.
  */
 
-import type { NoteContent } from '../domain/types.js';
+import { SOAP_SECTIONS, type NoteContent, type SoapSection } from '../domain/types.js';
 
 // ---------------------------------------------------------------------------
 // Collaborators (injected)
@@ -47,6 +47,9 @@ export interface ConflictInfo {
 export type SaveOutcome =
   | { status: 'saved'; version: VersionRef }
   | ({ status: 'conflict' } & ConflictInfo)
+  // The save was durably queued offline; it will sync on reconnect. The base
+  // does not advance (all offline edits branch from the same version).
+  | { status: 'queued' }
   | { status: 'error'; retryable: boolean; message: string };
 
 export type SaveFn = (req: SaveRequest) => Promise<SaveOutcome>;
@@ -70,6 +73,7 @@ export type AutosaveStatus =
   | 'dirty' // unsaved edits, debounce running
   | 'saving' // a POST is in flight
   | 'retrying' // a POST failed, waiting to retry the same mutation
+  | 'queued' // durably persisted offline, will sync on reconnect
   | 'conflict' // 409 — needs the user to resolve
   | 'error'; // non-retryable, or retries exhausted
 
@@ -80,6 +84,8 @@ export interface AutosaveState {
   lastSavedVersionId: string | null;
   /** Edits exist that are not yet durably saved. */
   hasUnsavedChanges: boolean;
+  /** Which SOAP sections differ from the last saved baseline (independently tracked). */
+  dirtySections: Record<SoapSection, boolean>;
   conflict: ConflictInfo | null;
   error: string | null;
 }
@@ -88,6 +94,8 @@ export interface AutosaveOptions {
   noteId: string;
   baseVersionId: string;
   save: SaveFn;
+  /** The head content at mount, used as the baseline for per-section dirty tracking. */
+  initialContent?: NoteContent;
   debounceMs?: number;
   maxRetries?: number;
   /** Backoff for retry N (1-based). Default: 200ms, 600ms, 1400ms... */
@@ -119,6 +127,8 @@ export class AutosaveEngine {
   private draft: NoteContent | null = null;
   /** True when `draft` has edits not yet accepted by the server. */
   private dirty = false;
+  /** Last durably-saved content; the baseline for per-section dirty comparison. */
+  private baseline: NoteContent | null = null;
 
   private debounceHandle: unknown = null;
   private retryHandle: unknown = null;
@@ -137,6 +147,7 @@ export class AutosaveEngine {
     this.backoffMs = opts.backoffMs ?? ((n) => 200 * (2 * n - 1));
     this.scheduler = opts.scheduler ?? defaultScheduler;
     this.newMutationId = opts.newMutationId ?? (() => `mut_${Date.now()}_${++mutationCounter}`);
+    this.baseline = opts.initialContent ?? null;
   }
 
   // -- subscription ---------------------------------------------------------
@@ -294,6 +305,7 @@ export class AutosaveEngine {
         this.error = null;
         this.baseVersionId = outcome.version.id;
         this.lastSavedVersionId = outcome.version.id;
+        this.baseline = req.content; // this content is now durable
         // Edits landed during the save? Coalesced follow-up runs now.
         if (this.dirty) this.beginSave();
         else this.setStatus('idle');
@@ -305,6 +317,17 @@ export class AutosaveEngine {
         // Keep the draft as "mine" so no work is lost; wait for resolveConflict.
         this.dirty = true;
         this.setStatus('conflict');
+        break;
+      }
+      case 'queued': {
+        // Durably persisted offline. The base does NOT advance — every offline
+        // edit branches from the same version and coalesces into one queued
+        // write, which replays on reconnect.
+        this.inFlight = null;
+        this.error = null;
+        this.baseline = req.content; // durably persisted locally
+        if (this.dirty) this.beginSave();
+        else this.setStatus('queued');
         break;
       }
       case 'error': {
@@ -339,9 +362,22 @@ export class AutosaveEngine {
       baseVersionId: this.baseVersionId,
       lastSavedVersionId: this.lastSavedVersionId,
       hasUnsavedChanges: this.dirty || this.isInFlight(),
+      dirtySections: this.computeDirtySections(),
       conflict: this.conflict,
       error: this.error,
     };
+  }
+
+  /** Per-section comparison of the current draft against the saved baseline. */
+  private computeDirtySections(): Record<SoapSection, boolean> {
+    const result = {} as Record<SoapSection, boolean>;
+    for (const s of SOAP_SECTIONS) {
+      result[s] =
+        this.draft !== null &&
+        this.baseline !== null &&
+        this.draft.sections[s] !== this.baseline.sections[s];
+    }
+    return result;
   }
 
   private emit(): void {

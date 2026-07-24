@@ -161,6 +161,64 @@ describe('single-flight and coalescing', () => {
   });
 });
 
+describe('offline queued outcome', () => {
+  it('reports queued and does not advance the base', async () => {
+    const { engine, scheduler, deferreds } = setup();
+    engine.change(content('a'));
+    scheduler.runAll();
+    deferreds[0]!.resolve({ status: 'queued' });
+    await flush();
+    const s = engine.getState();
+    expect(s.status).toBe('queued');
+    expect(s.baseVersionId).toBe('ver_1'); // unchanged — offline edits share the base
+  });
+
+  it('coalesces a follow-up edit made while offline into the next queued save', async () => {
+    const { engine, scheduler, calls, deferreds } = setup();
+    engine.change(content('a'));
+    scheduler.runAll();
+    engine.change(content('b')); // more edits while the first is "in flight"
+    deferreds[0]!.resolve({ status: 'queued' });
+    await flush();
+    expect(calls).toHaveLength(2); // follow-up saved (queued) too
+    expect(calls[1]!.content).toEqual(content('b'));
+    expect(calls[1]!.baseVersionId).toBe('ver_1'); // still the same base
+  });
+});
+
+describe('per-section dirty tracking', () => {
+  const four = (S: string, O: string, A: string, P: string): NoteContent => ({ sections: { S, O, A, P } });
+
+  const withBaseline = (initialContent: NoteContent) => {
+    const scheduler = new ManualScheduler();
+    const saver = makeSaver();
+    const engine = new AutosaveEngine({
+      noteId: 'n1',
+      baseVersionId: 'ver_1',
+      save: saver.save,
+      scheduler,
+      newMutationId: () => 'm',
+      initialContent,
+    });
+    return { engine, scheduler, ...saver };
+  };
+
+  it('marks only the sections that differ from the baseline', () => {
+    const { engine } = withBaseline(four('base', 'base', 'base', 'base'));
+    engine.change(four('edited S', 'base', 'edited A', 'base'));
+    expect(engine.getState().dirtySections).toEqual({ S: true, O: false, A: true, P: false });
+  });
+
+  it('clears a section once the save lands (baseline advances)', async () => {
+    const { engine, scheduler, deferreds } = withBaseline(four('base', 'base', 'base', 'base'));
+    engine.change(four('edited', 'base', 'base', 'base'));
+    scheduler.runAll();
+    deferreds[0]!.resolve(saved('ver_2'));
+    await flush();
+    expect(engine.getState().dirtySections).toEqual({ S: false, O: false, A: false, P: false });
+  });
+});
+
 describe('idempotency', () => {
   it('reuses one mutation id across retries of the same save', async () => {
     const { engine, scheduler, calls, deferreds } = setup({ maxRetries: 3 });

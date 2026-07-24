@@ -43,10 +43,16 @@ export function ActionBar({
             key={type}
             type="button"
             className="action-btn"
-            disabled={disabled}
+            // Use aria-disabled (not the `disabled` attribute) so the control
+            // stays keyboard-focusable and a screen-reader user can still reach
+            // its explanatory label — the whole point of "show the reason".
+            aria-disabled={disabled}
             title={reason}
             aria-label={reason ? `${LABELS[type]} — ${reason}` : LABELS[type]}
-            onClick={() => onAction(type)}
+            onClick={() => {
+              if (disabled) return; // guarded: a rogue click on a disabled action is a no-op
+              onAction(type);
+            }}
           >
             {LABELS[type]}
           </button>

@@ -11,14 +11,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { useRuntime } from '../RuntimeContext.js';
 import { useNote } from '../hooks.js';
 import { ActionBar } from './ActionBar.js';
 import { ConflictDialog } from './ConflictDialog.js';
 import { VersionHistory } from './VersionHistory.js';
 import { AutosaveEngine, type AutosaveState, type ConflictInfo, type SaveRequest } from '../../app/autosave.js';
-import { isContentEditable, type UserActionType } from '../../domain/machine.js';
+import { isContentEditable, transition as machineTransition, type Action, type UserActionType } from '../../domain/machine.js';
 import { SOAP_SECTIONS, type NoteContent, type NoteSnapshot, type SoapSection } from '../../domain/types.js';
+import type { NoteRecord } from '../../data/store.js';
 import type { Viewer } from '../../app/reconciler.js';
 
 const SECTION_LABELS: Record<SoapSection, string> = {
@@ -31,6 +33,7 @@ const SECTION_LABELS: Record<SoapSection, string> = {
 export function NoteDetailView(): JSX.Element {
   const { id } = useParams<{ id: string }>();
   const runtime = useRuntime();
+  const queryClient = useQueryClient();
   const { data: note, isLoading, isError, error, refetch } = useNote(id);
   const actor = runtime.getActor();
 
@@ -38,6 +41,7 @@ export function NoteDetailView(): JSX.Element {
   const [autosave, setAutosave] = useState<AutosaveState | null>(null);
   const [conflict, setConflict] = useState<{ info: ConflictInfo; base: NoteContent; theirs: NoteContent } | null>(null);
   const [viewers, setViewers] = useState<Viewer[]>([]);
+  const [actionError, setActionError] = useState<string | null>(null);
   const engineRef = useRef<AutosaveEngine | null>(null);
 
   // Open the three-way merge for a server version that superseded our base.
@@ -95,7 +99,9 @@ export function NoteDetailView(): JSX.Element {
     const engine = new AutosaveEngine({
       noteId: id,
       baseVersionId: initial?.currentVersionId ?? '',
-      save: (req: SaveRequest) => runtime.api.saveVersion(req, actor),
+      ...(head ? { initialContent: structuredClone(head.content) } : {}),
+      // Route through the coordinator: online → API, offline → durable queue.
+      save: (req: SaveRequest) => runtime.saveCoordinator.save(req),
     });
     engineRef.current = engine;
     const unsub = engine.subscribe(setAutosave);
@@ -204,16 +210,62 @@ export function NoteDetailView(): JSX.Element {
   };
 
   const onAction = async (type: UserActionType): Promise<void> => {
+    if (!id) return;
     let reason: string | undefined;
     if (type === 'reject') {
       reason = window.prompt('Reason for rejection?') ?? undefined;
       if (!reason) return;
     }
-    const action = type === 'reject' ? { type, reason: reason as string } : { type };
-    runtime.telemetry.track('note.action', { noteId: note.id, action: type, status: note.status });
-    const result = await runtime.api.transition(note.id, action, actor);
-    if (!result.ok) window.alert(result.reason ?? 'Action rejected by server');
-    await refetch();
+    const action: Action = type === 'reject' ? { type, reason: reason as string } : { type };
+    const env = { now: Date.now() };
+    const localEventId = `local_${env.now}_${Math.random().toString(36).slice(2)}`;
+
+    // Validate against the machine and compute the optimistic next state up front.
+    const optimistic = machineTransition(snapshot, action, actor, env, { eventId: localEventId });
+    if (!optimistic.ok) {
+      setActionError(optimistic.denial.reason);
+      return;
+    }
+
+    const key = ['note', id];
+    const previous = queryClient.getQueryData<NoteRecord>(key);
+
+    // Apply optimistically: update status now and append a PENDING local
+    // ReviewEvent, so the UI reflects the transition immediately.
+    queryClient.setQueryData<NoteRecord>(key, (old) =>
+      old
+        ? {
+            ...old,
+            status: optimistic.note.status,
+            assignedReviewerId: optimistic.note.assignedReviewerId,
+            approvedAt: optimistic.note.approvedAt,
+            events: [...old.events, optimistic.event],
+          }
+        : old,
+    );
+    setActionError(null);
+    runtime.telemetry.track('note.action', { noteId: id, action: type, status: snapshot.status });
+
+    const ack = await runtime.api.transition(id, action, actor);
+    if (ack.ok) {
+      // Reconcile: swap the provisional event id for the server's and clear the
+      // pending flag; mark it seen so the matching real-time echo dedupes.
+      runtime.reconciler.markSeen(ack.eventId);
+      queryClient.setQueryData<NoteRecord>(key, (old) =>
+        old
+          ? {
+              ...old,
+              events: old.events.map((e) =>
+                e.eventId === localEventId ? { ...e, eventId: ack.eventId, pending: false } : e,
+              ),
+            }
+          : old,
+      );
+    } else {
+      // Roll back cleanly to the pre-action snapshot and surface the reason.
+      if (previous) queryClient.setQueryData(key, previous);
+      setActionError(ack.reason);
+    }
   };
 
   return (
@@ -227,6 +279,12 @@ export function NoteDetailView(): JSX.Element {
 
       <ActionBar note={snapshot} actor={actor} now={Date.now()} onAction={(t) => void onAction(t)} />
 
+      {actionError && (
+        <p className="action-error" role="alert">
+          {actionError}
+        </p>
+      )}
+
       {locked && (
         <p className="locked-note" role="note">
           This note is locked after the 24-hour grace period. Start an amendment to make changes.
@@ -235,19 +293,29 @@ export function NoteDetailView(): JSX.Element {
 
       <div className="detail-body">
         <div className="soap">
-          {SOAP_SECTIONS.map((s) => (
-            <label key={s} className="soap-section">
-              <span className="soap-label">{SECTION_LABELS[s]}</span>
-              <textarea
-                className="soap-input"
-                value={content.sections[s]}
-                readOnly={!editable}
-                aria-readonly={!editable}
-                onChange={(e) => onSectionChange(s, e.target.value)}
-                rows={4}
-              />
-            </label>
-          ))}
+          {SOAP_SECTIONS.map((s) => {
+            const sectionDirty = autosave?.dirtySections[s] ?? false;
+            return (
+              <label key={s} className="soap-section">
+                <span className="soap-label">
+                  {SECTION_LABELS[s]}
+                  {sectionDirty && (
+                    <span className="soap-dirty" title="Unsaved changes in this section" aria-label="unsaved changes">
+                      {' '}•
+                    </span>
+                  )}
+                </span>
+                <textarea
+                  className="soap-input"
+                  value={content.sections[s]}
+                  readOnly={!editable}
+                  aria-readonly={!editable}
+                  onChange={(e) => onSectionChange(s, e.target.value)}
+                  rows={4}
+                />
+              </label>
+            );
+          })}
         </div>
 
         <VersionHistory versions={note.versions} currentVersionId={note.currentVersionId} />
@@ -276,6 +344,7 @@ function SaveIndicator({ state }: { state: AutosaveState | null }): JSX.Element 
     dirty: 'Editing…',
     saving: 'Saving…',
     retrying: 'Retrying…',
+    queued: 'Saved offline — will sync',
     conflict: 'Conflict — needs resolving',
     error: 'Save failed',
   };

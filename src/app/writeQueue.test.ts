@@ -26,6 +26,35 @@ const setup = (save: ReplaySave, storage = new MemoryQueueStorage()) => {
 
 // ---------------------------------------------------------------------------
 
+describe('upsertForNote — offline draft coalescing', () => {
+  const save: ReplaySave = async () => ({ status: 'saved', version: { id: 'v', revision: 2 } });
+
+  it('appends when the note has no pending write', async () => {
+    const { queue } = setup(save);
+    await queue.upsertForNote(enqueueWrite('n1', 'v1', 'a', 'm1'));
+    expect(queue.depth).toBe(1);
+  });
+
+  it('replaces the pending write for the same note, keeping one entry', async () => {
+    const { queue, storage } = setup(save);
+    await queue.upsertForNote(enqueueWrite('n1', 'v1', 'a', 'm1'));
+    await queue.upsertForNote(enqueueWrite('n1', 'v1', 'b', 'm2'));
+    await queue.upsertForNote(enqueueWrite('n1', 'v1', 'c', 'm3'));
+    expect(queue.depth).toBe(1);
+    const rows = await storage.getAll();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.content.sections.S).toBe('c'); // latest content wins
+    expect(rows[0]!.clientMutationId).toBe('m1'); // original id kept (idempotent)
+  });
+
+  it('keeps separate entries for different notes', async () => {
+    const { queue } = setup(save);
+    await queue.upsertForNote(enqueueWrite('n1', 'v1', 'a', 'm1'));
+    await queue.upsertForNote(enqueueWrite('n2', 'v1', 'b', 'm2'));
+    expect(queue.depth).toBe(2);
+  });
+});
+
 describe('enqueue and persistence', () => {
   it('persists before considering an entry enqueued', async () => {
     const storage = new MemoryQueueStorage();

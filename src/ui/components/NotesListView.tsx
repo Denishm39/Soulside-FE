@@ -11,16 +11,21 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { useQueryClient, type InfiniteData } from '@tanstack/react-query';
 import { useNotesList } from '../hooks.js';
+import { useRuntime } from '../RuntimeContext.js';
 import { useSelection } from '../selectionStore.js';
-import { parseQuery, toSearchParams, toDateInput, REVIEWER_OPTIONS, type SortField } from '../urlState.js';
+import { applyStatusToPages } from '../listCache.js';
+import { parseQuery, toSearchParams, toDateInput, queryKey, REVIEWER_OPTIONS, type SortField } from '../urlState.js';
 import { NOTE_STATUSES, type NoteStatus } from '../../domain/types.js';
-import type { NoteRecord } from '../../data/store.js';
+import type { ListResult, NoteRecord } from '../../data/store.js';
 
 const ROW_HEIGHT = 56;
 
 export function NotesListView(): JSX.Element {
   const [searchParams, setSearchParams] = useSearchParams();
+  const runtime = useRuntime();
+  const queryClient = useQueryClient();
   const query = useMemo(() => parseQuery(searchParams), [searchParams]);
 
   const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage } =
@@ -52,6 +57,29 @@ export function NotesListView(): JSX.Element {
       void fetchNextPage();
     }
   }, [items, rows.length, hasNextPage, isFetchingNextPage, fetchNextPage]);
+
+  // Subscribe the notes currently in the viewport to the real-time channel, and
+  // release those that scroll away (ref-counted, so no leaks across a long
+  // session). This is the list side of "subscribe to rows in view".
+  useEffect(() => {
+    const visibleIds = items
+      .map((vi) => rows[vi.index]?.id)
+      .filter((x): x is string => Boolean(x));
+    runtime.subscriptions.setActive(visibleIds);
+    return () => runtime.subscriptions.setActive([]);
+  }, [items, rows, runtime.subscriptions]);
+
+  // A status push for a visible row patches that row in the cache — no refetch,
+  // so the list never jumps or blinks.
+  useEffect(() => {
+    const key = ['notes', queryKey(query)];
+    return runtime.onNoteEvent((event) => {
+      if (event.type !== 'note.status_changed') return;
+      queryClient.setQueryData<InfiniteData<ListResult>>(key, (old) =>
+        applyStatusToPages(old, event.noteId, event.toStatus),
+      );
+    });
+  }, [runtime, queryClient, query]);
 
   const patch = (next: Partial<typeof query>) =>
     setSearchParams(toSearchParams({ ...query, ...next }), { replace: true });
@@ -199,19 +227,24 @@ function SortHeader({ field, dir, onSort }: { field: SortField; dir: 'asc' | 'de
     { f: 'status', label: 'Status' },
   ];
   return (
-    <div className="sort-header">
+    <div className="sort-header" role="row">
       {cols.map(({ f, label }) => {
         const active = field === f;
         return (
-          <button
+          // aria-sort belongs on the column-header cell, not the button.
+          <div
             key={f}
-            type="button"
-            className={`sort-btn ${active ? 'is-active' : ''}`}
+            role="columnheader"
             aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'}
-            onClick={() => onSort(f, active && dir === 'desc' ? 'asc' : 'desc')}
           >
-            {label} {active ? (dir === 'desc' ? '▼' : '▲') : ''}
-          </button>
+            <button
+              type="button"
+              className={`sort-btn ${active ? 'is-active' : ''}`}
+              onClick={() => onSort(f, active && dir === 'desc' ? 'asc' : 'desc')}
+            >
+              {label} {active ? (dir === 'desc' ? '▼' : '▲') : ''}
+            </button>
+          </div>
         );
       })}
     </div>

@@ -14,8 +14,9 @@ import './ui/styles.css';
 
 const runtime = createRuntime({ seed: 1, count: 5000 });
 
-// Rehydrate any writes queued in a previous session, and drain parked telemetry.
-void runtime.writeQueue.hydrate().then(() => runtime.writeQueue.replay());
+// Rehydrate any writes queued in a previous session and replay them (through the
+// coordinator, so a replay conflict surfaces the merge), then drain telemetry.
+void runtime.writeQueue.hydrate().then(() => runtime.saveCoordinator.replay());
 void runtime.telemetry.drainParked();
 
 // Never lose telemetry on unload; flush on tab hide too (a session boundary).

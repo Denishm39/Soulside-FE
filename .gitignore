@@ -12,6 +12,9 @@ vite.config.*.timestamp-*.mjs
 # FUSE/mount artifacts left when a file is rewritten while open
 .fuse_hidden*
 
+# scratch
+/tmp/
+
 # IntelliJ / editor
 .idea/
 .junie/

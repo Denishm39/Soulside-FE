@@ -19,11 +19,19 @@ describe('ActionBar', () => {
   it('renders enabled and disabled actions derived from the machine', () => {
     render(<ActionBar note={note()} actor={reviewer} now={NOW} onAction={() => {}} />);
     // A reviewer on a READY_FOR_REVIEW note can start a review...
-    const start = screen.getByRole('button', { name: /Start review/ }) as HTMLButtonElement;
-    expect(start.disabled).toBe(false);
-    // ...but cannot approve yet.
-    const approve = screen.getByRole('button', { name: /Approve/ }) as HTMLButtonElement;
-    expect(approve.disabled).toBe(true);
+    const start = screen.getByRole('button', { name: /Start review/ });
+    expect(start.getAttribute('aria-disabled')).toBe('false');
+    // ...but cannot approve yet — and it stays focusable so the reason is reachable.
+    const approve = screen.getByRole('button', { name: /Approve/ });
+    expect(approve.getAttribute('aria-disabled')).toBe('true');
+    expect(approve.hasAttribute('disabled')).toBe(false); // NOT the disabled attribute
+  });
+
+  it('a disabled action does not fire onAction when clicked (guarded)', () => {
+    const onAction = vi.fn();
+    render(<ActionBar note={note()} actor={reviewer} now={NOW} onAction={onAction} />);
+    screen.getByRole('button', { name: /Approve/ }).click();
+    expect(onAction).not.toHaveBeenCalled();
   });
 
   it('exposes the denial reason on a disabled action', () => {

@@ -94,8 +94,9 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 
 .action-bar { display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }
 .action-btn { padding: 6px 12px; border: 1px solid var(--line); background: var(--surface); border-radius: 6px; cursor: pointer; }
-.action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.action-btn[aria-disabled='true'] { opacity: 0.5; cursor: not-allowed; }
 
+.action-error { background: #fee2e2; color: var(--danger); padding: 8px 12px; border-radius: 6px; margin: 8px 0; }
 .locked-note { background: var(--warn-bg); color: var(--warn-ink); padding: 10px 12px; border-radius: 6px; }
 
 .detail-body { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; }
@@ -117,6 +118,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .soap { display: grid; gap: 12px; }
 .soap-section { display: flex; flex-direction: column; gap: 4px; }
 .soap-label { font-weight: 600; font-size: 13px; }
+.soap-dirty { color: var(--accent); font-size: 16px; vertical-align: middle; }
 .soap-input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; resize: vertical; }
 .soap-input[readonly] { background: #f2f3f5; color: var(--muted); }
 

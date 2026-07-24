@@ -20,7 +20,11 @@ export interface NotesApi {
   getNote(id: string): Promise<NoteRecord>;
   saveVersion(req: SaveRequest, author: Actor): Promise<SaveOutcome>;
   replayWrite(entry: QueuedWrite, author: Actor): Promise<ReplayResult>;
-  transition(noteId: string, action: Action, actor: Actor): Promise<{ ok: boolean; reason?: string }>;
+  transition(
+    noteId: string,
+    action: Action,
+    actor: Actor,
+  ): Promise<{ ok: true; eventId: string } | { ok: false; reason: string }>;
 }
 
 export class BackendApi implements NotesApi {
@@ -57,9 +61,15 @@ export class BackendApi implements NotesApi {
     }
   }
 
-  async transition(noteId: string, action: Action, actor: Actor): Promise<{ ok: boolean; reason?: string }> {
+  async transition(
+    noteId: string,
+    action: Action,
+    actor: Actor,
+  ): Promise<{ ok: true; eventId: string } | { ok: false; reason: string }> {
     const result = await this.backend.postTransition(noteId, action, actor);
-    return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+    // The server-assigned eventId is threaded through so the client can reconcile
+    // its optimistic local ReviewEvent with the authoritative one on ack.
+    return result.ok ? { ok: true, eventId: result.eventId } : { ok: false, reason: result.reason };
   }
 
   private toSaveOutcome(

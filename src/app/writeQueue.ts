@@ -123,6 +123,34 @@ export class WriteQueue {
   }
 
   /**
+   * Upsert the single pending offline draft for a note: replace the existing
+   * queued write for that note (keeping its position and mutation id) or append
+   * a new one. This coalesces successive offline edits the way autosave
+   * coalesces online ones, so a burst of offline edits becomes one write that
+   * replays cleanly against a single base — not N writes that conflict with each
+   * other on reconnect. Not used while an entry is mid-replay (blocked).
+   */
+  async upsertForNote(write: Omit<QueuedWrite, 'id' | 'enqueuedAt'>): Promise<QueuedWrite> {
+    const existingIndex = this.entries.findIndex(
+      (e) => e.noteId === write.noteId && this.blocked?.entry.id !== e.id,
+    );
+    if (existingIndex === -1) return this.enqueue(write);
+
+    const existing = this.entries[existingIndex]!;
+    const updated: QueuedWrite = {
+      ...existing,
+      baseVersionId: write.baseVersionId,
+      content: write.content,
+      // Keep the original mutation id so a retry of an already-delivered write
+      // stays idempotent.
+    };
+    await this.storage.put(updated);
+    this.entries[existingIndex] = updated;
+    this.emit();
+    return updated;
+  }
+
+  /**
    * Drain the queue in order. Stops at the first conflict or non-retryable
    * error, leaving that entry and everything after it intact. Safe to call
    * repeatedly (e.g. on every reconnect); overlapping calls are coalesced.
